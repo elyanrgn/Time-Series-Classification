@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
 from torch.utils.data import DataLoader
@@ -13,6 +12,8 @@ class CNNBaseline(nn.Module):
         n_classes=14,
         n_filters1=64,
         n_filters2=128,
+        n_filters3=256,
+        n_filters4=512,
         kernel_size=3,
         dropout=0.5,
     ):
@@ -26,10 +27,16 @@ class CNNBaseline(nn.Module):
             nn.Conv1d(n_filters1, n_filters2, kernel_size=kernel_size, padding=padding),
             nn.BatchNorm1d(n_filters2),
             nn.ReLU(),
+            nn.Conv1d(n_filters2, n_filters3, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(n_filters3),
+            nn.ReLU(),
+            nn.Conv1d(n_filters3, n_filters4, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(n_filters4),
+            nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),  # global average pooling sur le temps
             nn.Flatten(),
             nn.Dropout(dropout),
-            nn.Linear(n_filters2, n_classes),
+            nn.Linear(n_filters4, n_classes),
         )
 
     def forward(self, x):
@@ -135,6 +142,8 @@ def hyperparam_search(train_loader, val_loader, n_features, n_classes, device=No
         {
             "n_filters1": 32,
             "n_filters2": 64,
+            "n_filters3": 128,
+            "n_filters4": 256,
             "dropout": 0.3,
             "lr": 1e-3,
             "weight_decay": 1e-4,
@@ -142,6 +151,8 @@ def hyperparam_search(train_loader, val_loader, n_features, n_classes, device=No
         {
             "n_filters1": 64,
             "n_filters2": 128,
+            "n_filters3": 256,
+            "n_filters4": 512,
             "dropout": 0.5,
             "lr": 1e-3,
             "weight_decay": 1e-4,
@@ -149,13 +160,17 @@ def hyperparam_search(train_loader, val_loader, n_features, n_classes, device=No
         {
             "n_filters1": 64,
             "n_filters2": 128,
-            "dropout": 0.5,
+            "n_filters3": 256,
+            "n_filters4": 512,
+            "dropout": 0.3,
             "lr": 5e-4,
             "weight_decay": 1e-4,
         },
         {
             "n_filters1": 64,
             "n_filters2": 128,
+            "n_filters3": 256,
+            "n_filters4": 512,
             "dropout": 0.3,
             "lr": 1e-3,
             "weight_decay": 5e-4,
@@ -173,6 +188,8 @@ def hyperparam_search(train_loader, val_loader, n_features, n_classes, device=No
             n_classes=n_classes,
             n_filters1=cfg["n_filters1"],
             n_filters2=cfg["n_filters2"],
+            n_filters3=cfg["n_filters3"],
+            n_filters4=cfg["n_filters4"],
             dropout=cfg["dropout"],
         )
 
