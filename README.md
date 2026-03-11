@@ -1,30 +1,73 @@
-# Time-Series Transformers for LSST Classification 🪐⚡
+# Time-Series Transformers for LSST Classification
 
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-orange.svg)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+## Project Goal
+Study the effect of pretraining an IndPatchTST backbone on ETTh1 (regression) and transferring it to LSST time-series classification. The objective is not to maximize accuracy, but to explain and justify each design choice (freezing strategy, hyperparameters, data handling, and evaluation).
 
-**Étude comparative CNN vs Transformer (IndPatchTST) pour classification multivariée de séries temporelles astronomiques (LSST UCR/UEA).**
+## Research Question
+Does pretraining on ETTh1 improve LSST classification compared to training from scratch, and under which fine-tuning strategy?
 
-## 🎯 Résumé des résultats (15 runs)
+## Key Ideas
+- ETTh1 provides long, regular multivariate sequences that can teach temporal patterns.
+- LSST is a smaller, noisy, multivariate classification dataset with a different domain.
+- Transfer is tested through controlled strategies: head-only, late-encoder tuning, full fine-tune, and scratch.
 
-| Stratégie | Acc (μ±σ) | F1-macro (μ±σ) | Δ vs CNN |
-|-----------|-----------|----------------|----------|
-| **CNN Baseline** | **0.540±0.043** | **0.395±0.039** | - |
-| TST From Scratch | **0.596±0.014** | 0.374±0.029 | **+0.056** |
-| Head Only (ETTh1) | 0.315±0.000 | 0.034±0.000 | -0.225 |
-| Late Enc + Head | 0.371±0.002 | 0.120±0.006 | -0.169 |
-| Full Fine-tune | 0.537±0.013 | 0.282±0.012 | -0.003 |
+## Methods
+### Datasets
+- **ETTh1**: Used for regression pretraining.
+- **LSST (UCR/UEA)**: Used for classification.
 
-**Conclusion :** L'architecture Transformer surpasse le CNN, mais le pré-entraînement ETTh1→LSST **n'améliore pas** les performances (mismatch domaine).
+### Models
+- **CNN baseline**: Simple 1D conv model for reference.
+- **IndPatchTST**: Channel-independent transformer with patching.
+- **IndPatchTSTClassifier**: Pretrained backbone + classification head.
 
-## 🚀 Installation rapide
+### Transfer Strategies
+- **Scratch**: Train full model from random init.
+- **Head-only**: Freeze backbone, train classifier head only.
+- **Late encoders**: Unfreeze last transformer layers + head.
+- **Full fine-tune**: Unfreeze all with smaller LR for backbone.
 
+### Hyperparameters
+Tuned with Optuna, **one study per strategy** to avoid cross-strategy bias. Best configs are saved as YAML in `configs/` and reused by evaluation notebooks.
+
+## Repository Structure
+- `src/` code for models, training, and data.
+- `notebooks/` EDA and training notebooks.
+- `configs/` YAMLs for pretrained and fine-tuning settings.
+- `artifacts/` generated outputs (models, reports, experiments).
+- `data/` local datasets (not tracked).
+
+## Setup
 ```bash
-# 1. Clone + env
-git clone <repo> && cd time-series-transformers
-conda create -n ts-lsst python=3.10 -y
-conda activate ts-lsst
+python -m venv .venv
+. .venv/Scripts/activate  # Windows
 pip install -r requirements.txt
+pip install -e .
+```
 
-# 2. Données UCR/UEA (auto-téléchargées)
+## Data
+- **ETTh1**: place `ETTh1.csv` in `data/`.
+- **LSST**: auto-downloaded via `tslearn` on first run.
+
+## Reproducibility
+### Notebooks
+- `01_eda.ipynb`: dataset exploration
+- `02_train_cnn.ipynb`: CNN baseline (multi-run stats)
+- `03_pretrain_indpatchtst.ipynb`: pretraining with Bayesian search
+- `04_train_indpatchtst_classifier.ipynb`: multi-run stats using YAML configs
+
+### Scripts
+- Pretraining: `python -m src.models.indpatchtst`
+- Transfer experiments: `python -m src.training.adapting_to_classification`
+
+## Outputs
+- Models are saved under `artifacts/models/`.
+- Reports and aggregated results under `artifacts/reports/`.
+
+## Limitations
+- Domain shift between ETTh1 (energy/meteorological signals) and LSST (astronomy).
+- LSST is small; variance is high. We report means and standard deviations across multiple seeds.
+- Pretraining is regression while target is classification, which may limit transfer.
+
+## What to Expect
+The main value is the **analysis of transfer strategies and their rationale**, not the absolute performance. Results should be interpreted in terms of stability and generalization rather than single-run peaks.

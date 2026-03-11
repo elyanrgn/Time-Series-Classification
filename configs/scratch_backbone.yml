@@ -1,0 +1,8 @@
+d_model: 256
+n_heads: 8
+n_layers: 3
+d_ff: 512
+dropout: 0.06751582526902497
+patch_len: 12
+stride: 2
+revin: false
