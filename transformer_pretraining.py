@@ -90,6 +90,18 @@ def build_etth1_dataloaders(csv_path, window=36, horizon=24, batch_size=64, spli
 
 
 class RevIN(nn.Module):
+    """
+    Reversible Instance Normalization.
+
+    Correction clé : mean et std sont retournés explicitement par norm()
+    et passés en argument à denorm(), au lieu d'être stockés comme attributs
+    d'instance. Le stockage en attribut causait deux problèmes :
+      1. En mode eval (torch.no_grad), entre deux batchs de tailles différentes,
+         self.mean/self.std pouvaient pointer vers le mauvais batch ou être None.
+      2. En cas de séries quasi-constantes (std ≈ 0), la division dans denorm
+         produisait des inf/nan. On clippe maintenant std à eps minimum.
+    """
+
     def __init__(self, num_features, target_channel=-1, eps=1e-5):
         super().__init__()
         self.num_features = num_features
@@ -98,16 +110,35 @@ class RevIN(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, 1, num_features))
         self.target_channel = target_channel
 
-    def forward(self, x, mode):
+    def norm(self, x):
+        """x : (B, T, C) → x_norm : (B, T, C), retourne aussi (mean, std) pour denorm."""
+        mean = x.mean(dim=1, keepdim=True)  # (B, 1, C)
+        std = x.std(dim=1, keepdim=True).clamp(
+            min=self.eps
+        )  # (B, 1, C) — clamp évite /0
+        x_norm = (x - mean) / std * self.gamma + self.beta
+        return x_norm, mean, std
+
+    def denorm(self, x, mean, std):
+        """x : (B, T, 1) — dénormalise le canal cible avec mean/std reçus de norm()."""
+        tc = self.target_channel
+        # gamma/beta sont de shape (1,1,C) ; on indexe le canal cible
+        x_denorm = (x - self.beta[:, :, tc : tc + 1]) / self.gamma[
+            :, :, tc : tc + 1
+        ].clamp(min=self.eps)
+        return x_denorm * std[:, :, tc : tc + 1] + mean[:, :, tc : tc + 1]
+
+    def forward(self, x, mode, mean=None, std=None):
+        """Compatibilité ascendante : accepte toujours l'ancienne interface à 2 args."""
         if mode == "norm":
-            self.mean = x.mean(dim=1, keepdim=True)
-            self.std = x.std(dim=1, keepdim=True) + self.eps
-            return (x - self.mean) / self.std * self.gamma + self.beta
+            x_norm, mean, std = self.norm(x)
+            return x_norm, mean, std
         elif mode == "denorm":
-            tc = self.target_channel
-            return (x - self.beta[:, :, tc : tc + 1]) / self.gamma[
-                :, :, tc : tc + 1
-            ] * self.std[:, :, tc : tc + 1] + self.mean[:, :, tc : tc + 1]
+            if mean is None or std is None:
+                raise ValueError(
+                    "RevIN.forward(denorm) requiert mean et std explicites."
+                )
+            return self.denorm(x, mean, std)
         raise ValueError("mode must be 'norm' or 'denorm'")
 
 
@@ -193,7 +224,8 @@ class IndPatchTST(nn.Module):
           chaque patch contribue au vecteur de sortie utilisé pour prédire.
         """
         if self.revin:
-            x = self.revin_layer(x, mode="norm")
+            # norm() retourne explicitement (mean, std) — stockés pour denorm dans forward()
+            x, self._revin_mean, self._revin_std = self.revin_layer.norm(x)
 
         B, T, C = x.shape
         x_chan = x.permute(0, 2, 1).reshape(B * C, T, 1)
@@ -208,10 +240,11 @@ class IndPatchTST(nn.Module):
         return feats
 
     def forward(self, x):
-        feats = self.forward_features(x)
+        feats = self.forward_features(x)  # appelle revin norm si besoin
         out = self.head(feats).unsqueeze(-1)
         if self.revin:
-            out = self.revin_layer(out, mode="denorm")
+            # denorm avec les mean/std sauvegardés lors du norm dans forward_features
+            out = self.revin_layer.denorm(out, self._revin_mean, self._revin_std)
         return out
 
 
@@ -384,7 +417,7 @@ if __name__ == "__main__":
     print(f"Input dim ETTh1 : {input_dim} | window={WINDOW} | horizon={HORIZON}")
 
     best_params, best_loss = bayesian_search(
-        train_dl, valid_dl, WINDOW, HORIZON, device, n_trials=30, max_epochs=20
+        train_dl, valid_dl, WINDOW, HORIZON, device, n_trials=100, max_epochs=20
     )
 
     # Ré-entraînement long avec la meilleure config
@@ -418,7 +451,7 @@ if __name__ == "__main__":
             "horizon": HORIZON,
             "valid_loss": best_loss,
         },
-        "models/best_indpatch_tst_optuna.pth",
+        "models/best_indpatch_tst_optuna2.pth",
     )
-    print("✅ Sauvé : models/best_indpatch_tst_optuna.pth")
+    print("✅ Sauvé : models/best_indpatch_tst_optuna2.pth")
     print(f"   Config : {best_params}")

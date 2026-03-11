@@ -236,7 +236,7 @@ def train_epoch(
     model, dl, optimizer, criterion, device, augment=False, scaler_amp=None
 ):
     model.train()
-    total_loss, correct = 0.0, 0
+    total_loss, correct, n_samples = 0.0, 0, 0
 
     for x, y in dl:
         x, y = x.to(device), y.to(device)
@@ -249,6 +249,11 @@ def train_epoch(
             with torch.amp.autocast(device_type="cuda"):
                 pred = model(x)
                 loss = criterion(pred, y)
+            # Si la loss est NaN/inf (overflow float16), scaler skip le step
+            # mais on doit aussi ne PAS accumuler dans total_loss
+            if not torch.isfinite(loss):
+                scaler_amp.update()  # met à jour le scale factor (le réduit)
+                continue
             scaler_amp.scale(loss).backward()
             scaler_amp.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -257,14 +262,19 @@ def train_epoch(
         else:
             pred = model(x)
             loss = criterion(pred, y)
+            if not torch.isfinite(loss):
+                continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
         total_loss += loss.item() * x.size(0)
         correct += (pred.argmax(1) == y).sum().item()
+        n_samples += x.size(0)
 
-    return total_loss / len(dl.dataset), correct / len(dl.dataset)
+    if n_samples == 0:
+        return float("nan"), 0.0
+    return total_loss / n_samples, correct / n_samples
 
 
 @torch.no_grad()
@@ -344,11 +354,39 @@ def evaluate(model, test_dl, device):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  OPTUNA — Tuning de la tête de classification
+#  OPTUNA — Une étude par stratégie pré-entraînée
+#
+#  Pourquoi une étude par stratégie ?
+#  lr_backbone n'a AUCUN signal dans objective_clf (backbone gelé) → Optuna
+#  choisit une valeur arbitraire dans [1e-6, 1e-4], qui se retrouve ensuite
+#  utilisée pour late_enc et full_tune où elle est critique. Chaque stratégie
+#  a sa propre dynamique d'entraînement et nécessite ses propres LR.
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def objective_clf(
+def _build_clf_model(
+    window, n_features, n_classes, backbone_config, hidden_dim, dropout_clf, device
+):
+    """Construit et retourne un IndPatchTSTClassifier avec tête personnalisée."""
+    model = IndPatchTSTClassifier(
+        window,
+        n_features,
+        n_classes,
+        backbone_config,
+        pretrained_model_path="models/best_indpatch_tst_optuna2.pth",
+    ).to(device)
+    d = backbone_config["d_model"]
+    model.classifier = nn.Sequential(
+        nn.LayerNorm(d),
+        nn.Linear(d, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(dropout_clf),
+        nn.Linear(hidden_dim, n_classes),
+    ).to(device)
+    return model
+
+
+def objective_head_only(
     trial,
     train_dl,
     val_dl,
@@ -360,74 +398,221 @@ def objective_clf(
     scaler_amp,
 ):
     """
-    Architecture backbone fixée (optimisée sur ETTh1).
-    Seuls les hyperparamètres de la tête et du fine-tuning sont tunés.
+    Stratégie B — Head Only.
+    Backbone entièrement gelé : seule la tête est entraînée.
+    Hyperparamètres tunés : hidden_dim, dropout_clf, lr_head, weight_decay.
+    lr_backbone n'est PAS tuné ici car il n'est pas utilisé dans cette stratégie.
     """
     hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
     dropout_clf = trial.suggest_float("dropout_clf", 0.2, 0.5)
-    lr_head = trial.suggest_float("lr_head", 1e-4, 5e-3, log=True)
-    lr_backbone = trial.suggest_float("lr_backbone", 1e-6, 1e-4, log=True)
+    lr_head = trial.suggest_float("lr_head", 1e-4, 3e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-4, 1e-2, log=True)
 
-    model = IndPatchTSTClassifier(
-        window,
-        n_features,
-        n_classes,
-        backbone_config,
-        pretrained_model_path="models/best_indpatch_tst_optuna.pth",
-    ).to(device)
-
-    d = backbone_config["d_model"]
-    model.classifier = nn.Sequential(
-        nn.LayerNorm(d),
-        nn.Linear(d, hidden_dim),
-        nn.GELU(),
-        nn.Dropout(dropout_clf),
-        nn.Linear(hidden_dim, n_classes),
-    ).to(device)
+    model = _build_clf_model(
+        window, n_features, n_classes, backbone_config, hidden_dim, dropout_clf, device
+    )
+    model.freeze_all_backbone()
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    opt = torch.optim.AdamW(model.classifier.parameters(), lr=lr_head, weight_decay=wd)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
     best_val_acc = 0.0
-
-    # Phase 1 : head only (10 epochs)
-    model.freeze_all_backbone()
-    opt1 = torch.optim.AdamW(model.classifier.parameters(), lr=lr_head, weight_decay=wd)
-    for epoch in range(10):
+    for epoch in range(20):
         train_epoch(
-            model,
-            train_dl,
-            opt1,
-            criterion,
-            device,
-            augment=True,
-            scaler_amp=scaler_amp,
+            model, train_dl, opt, criterion, device, augment=True, scaler_amp=scaler_amp
         )
         _, vl_acc = eval_epoch(model, val_dl, criterion, device)
+        sch.step()
         trial.report(vl_acc, epoch)
         if trial.should_prune():
             raise __import__("optuna").TrialPruned()
         best_val_acc = max(best_val_acc, vl_acc)
+    return best_val_acc
 
-    # Phase 2 : full fine-tune court (5 epochs)
-    model.unfreeze_all()
-    opt2 = torch.optim.AdamW(
+
+def objective_late_enc(
+    trial,
+    train_dl,
+    val_dl,
+    device,
+    window,
+    n_features,
+    n_classes,
+    backbone_config,
+    scaler_amp,
+):
+    """
+    Stratégie C — Late Encoders + Head.
+    Les 2 dernières couches transformer + tête sont dégelées.
+    Hyperparamètres tunés : lr_late (late encoders), lr_head, hidden_dim,
+    dropout_clf, weight_decay.
+    lr_late est distinct de lr_backbone car seules les late layers bougent.
+    """
+    hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    dropout_clf = trial.suggest_float("dropout_clf", 0.2, 0.5)
+    lr_late = trial.suggest_float("lr_late", 1e-5, 5e-4, log=True)
+    lr_head = trial.suggest_float("lr_head", 1e-4, 3e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-4, 1e-2, log=True)
+
+    model = _build_clf_model(
+        window, n_features, n_classes, backbone_config, hidden_dim, dropout_clf, device
+    )
+    model.unfreeze_late_encoders()
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    opt = torch.optim.AdamW(
         [
-            {"params": model.backbone.parameters(), "lr": lr_backbone},
-            {"params": model.classifier.parameters(), "lr": lr_head * 0.1},
+            {"params": model.group_enc_late.parameters(), "lr": lr_late},
+            {"params": model.classifier.parameters(), "lr": lr_head},
         ],
         weight_decay=wd,
     )
-    for epoch in range(5):
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
+    best_val_acc = 0.0
+    for epoch in range(20):
+        train_epoch(
+            model, train_dl, opt, criterion, device, augment=True, scaler_amp=scaler_amp
+        )
+        _, vl_acc = eval_epoch(model, val_dl, criterion, device)
+        sch.step()
+        trial.report(vl_acc, epoch)
+        if trial.should_prune():
+            raise __import__("optuna").TrialPruned()
+        best_val_acc = max(best_val_acc, vl_acc)
+    return best_val_acc
+
+
+def objective_full_tune(
+    trial,
+    train_dl,
+    val_dl,
+    device,
+    window,
+    n_features,
+    n_classes,
+    backbone_config,
+    scaler_amp,
+):
+    """
+    Stratégie D — Full Fine-tune avec LR différenciés.
+    Tout le modèle est dégelé. lr_backbone ≪ lr_head pour protéger
+    les features pré-apprises du catastrophic forgetting.
+    Hyperparamètres tunés : lr_backbone, lr_head, hidden_dim, dropout_clf, wd.
+    """
+    hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    dropout_clf = trial.suggest_float("dropout_clf", 0.2, 0.5)
+    lr_backbone = trial.suggest_float("lr_backbone", 1e-5, 3e-4, log=True)
+    lr_head = trial.suggest_float("lr_head", 1e-4, 3e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-4, 1e-2, log=True)
+
+    model = _build_clf_model(
+        window, n_features, n_classes, backbone_config, hidden_dim, dropout_clf, device
+    )
+    model.unfreeze_all()
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    opt = torch.optim.AdamW(
+        [
+            {"params": model.backbone.parameters(), "lr": lr_backbone},
+            {"params": model.classifier.parameters(), "lr": lr_head},
+        ],
+        weight_decay=wd,
+    )
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
+    best_val_acc = 0.0
+    for epoch in range(20):
         train_epoch(
             model,
             train_dl,
-            opt2,
+            opt,
             criterion,
             device,
             augment=False,
             scaler_amp=scaler_amp,
         )
         _, vl_acc = eval_epoch(model, val_dl, criterion, device)
+        sch.step()
+        trial.report(vl_acc, epoch)
+        if trial.should_prune():
+            raise __import__("optuna").TrialPruned()
+        best_val_acc = max(best_val_acc, vl_acc)
+    return best_val_acc
+
+
+def objective_scratch(
+    trial,
+    train_dl,
+    val_dl,
+    device,
+    window,
+    n_features,
+    n_classes,
+    scaler_amp,
+):
+    """
+    Recherche Optuna dédiée au modèle From Scratch.
+
+    Explore simultanément la config backbone ET les hyperparamètres
+    d'entraînement, directement sur la tâche de classification LSST.
+    C'est nécessaire car la config optimale pour la régression ETTh1
+    (minimiser MSE sur séries météo) n'est pas forcément optimale pour
+    classifier des objets astronomiques multivariés.
+    """
+    d_model = trial.suggest_categorical("d_model", [64, 128, 256])
+    valid_heads = [h for h in [1, 2, 4, 8] if d_model % h == 0]
+    n_heads = trial.suggest_categorical("n_heads", valid_heads)
+    patch_len = trial.suggest_int("patch_len", 3, window // 3)
+    stride = trial.suggest_int("stride", 1, max(1, window // 8))
+    if patch_len >= window:
+        raise __import__("optuna").TrialPruned()
+
+    scratch_config = {
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "n_layers": trial.suggest_int("n_layers", 2, 6),
+        "d_ff": trial.suggest_categorical("d_ff", [256, 512, 1024]),
+        "dropout": trial.suggest_float("dropout", 0.05, 0.4),
+        "revin": False,
+        "patch_len": patch_len,
+        "stride": stride,
+    }
+
+    hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    dropout_clf = trial.suggest_float("dropout_clf", 0.2, 0.5)
+    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-4, 1e-2, log=True)
+
+    model = IndPatchTSTClassifier(
+        window,
+        n_features,
+        n_classes,
+        scratch_config,
+        pretrained_model_path=None,
+    ).to(device)
+
+    model.classifier = nn.Sequential(
+        nn.LayerNorm(d_model),
+        nn.Linear(d_model, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(dropout_clf),
+        nn.Linear(hidden_dim, n_classes),
+    ).to(device)
+
+    model.unfreeze_all()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
+    best_val_acc = 0.0
+
+    for epoch in range(20):
+        train_epoch(
+            model, train_dl, opt, criterion, device, augment=True, scaler_amp=scaler_amp
+        )
+        _, vl_acc = eval_epoch(model, val_dl, criterion, device)
+        sch.step()
+        trial.report(vl_acc, epoch)
+        if trial.should_prune():
+            raise __import__("optuna").TrialPruned()
         best_val_acc = max(best_val_acc, vl_acc)
 
     return best_val_acc
@@ -445,7 +630,11 @@ def run_single_experiment(
     X_test,
     y_test_enc,
     backbone_config,
-    best_head_params,
+    scratch_config,
+    params_head_only,
+    params_late_enc,
+    params_full_tune,
+    best_scratch_params,
     n_classes,
     n_features,
     LSST_WINDOW,
@@ -453,22 +642,11 @@ def run_single_experiment(
     scaler_amp,
 ):
     """
-    Un run complet : 4 stratégies de fine-tuning comparées.
+    Un run complet : 4 stratégies comparées avec leurs hyperparamètres dédiés.
 
-    Protocole en 2 phases (progressive unfreezing) :
-    ─────────────────────────────────────────────────
-    Phase 1 — Warmup : entraîne uniquement les couches autorisées par la stratégie.
-               But : stabiliser la tête avant de toucher au backbone.
-    Phase 2 — Unfreeze total avec LR différenciés (lr_bb ≪ lr_head).
-               But : adapter le backbone sans détruire les features pré-apprises.
-               Appliquée seulement pour head_only et late_enc
-               (full_tune fait déjà le dégel total en phase 1).
-
-    Choix de la meilleure stratégie :
-    ──────────────────────────────────
-    Sélectionnée par Optuna sur un split fixe (seed=42) puis validée
-    statistiquement sur 15 runs avec des seeds variées (0..14).
-    La stratégie avec la meilleure acc_mean sur 15 runs est retenue.
+    Chaque stratégie (B, C, D) dispose de ses propres LR issus d'une étude
+    Optuna indépendante — sans biais croisé entre les stratégies.
+    Chaque stratégie conserve son niveau de gel pendant TOUS ses epochs.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -478,9 +656,6 @@ def run_single_experiment(
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train_enc, test_size=0.2, stratify=y_train_enc, random_state=seed
     )
-
-    # batch_size=32 : ~100 steps/epoch sur LSST train (~3200 samples)
-    # → assez de gradient updates pour converger sur des entraînements courts
     train_dl = DataLoader(
         TensorDataset(torch.from_numpy(X_tr).float(), torch.from_numpy(y_tr).long()),
         batch_size=32,
@@ -500,31 +675,27 @@ def run_single_experiment(
         shuffle=False,
     )
 
-    lr_h = best_head_params["lr_head"]
-    lr_bb = best_head_params["lr_backbone"]
-    wd = best_head_params["weight_decay"]
-
     run_results = {}
 
     strategies = {
         "A_scratch": ("From Scratch (baseline)", None, "scratch", 60),
         "B_head_only": (
             "Head Only",
-            "models/best_indpatch_tst_optuna.pth",
+            "models/best_indpatch_tst_optuna2.pth",
             "head_only",
-            30,
+            60,
         ),
         "C_late_enc": (
             "Late Encoders + Head",
-            "models/best_indpatch_tst_optuna.pth",
+            "models/best_indpatch_tst_optuna2.pth",
             "late_enc",
-            30,
+            50,
         ),
         "D_full_tune": (
             "Full Fine-tune (lr différenciés)",
-            "models/best_indpatch_tst_optuna.pth",
+            "models/best_indpatch_tst_optuna2.pth",
             "full",
-            30,
+            40,
         ),
     }
 
@@ -533,54 +704,85 @@ def run_single_experiment(
         print(f"  Stratégie : {label}")
         print(f"{'─' * 55}")
 
+        # ── Config et hyperparamètres dédiés à la stratégie ─────────────────
+        if strategy == "scratch":
+            cfg = scratch_config
+            hd = best_scratch_params["hidden_dim"]
+            do = best_scratch_params["dropout_clf"]
+        elif strategy == "head_only":
+            cfg = backbone_config
+            hd = params_head_only["hidden_dim"]
+            do = params_head_only["dropout_clf"]
+        elif strategy == "late_enc":
+            cfg = backbone_config
+            hd = params_late_enc["hidden_dim"]
+            do = params_late_enc["dropout_clf"]
+        else:  # full
+            cfg = backbone_config
+            hd = params_full_tune["hidden_dim"]
+            do = params_full_tune["dropout_clf"]
+
         model = IndPatchTSTClassifier(
             LSST_WINDOW,
             n_features,
             n_classes,
-            backbone_config,
+            cfg,
             pretrained_model_path=pretrained_path,
         ).to(device)
-
-        # Tête avec hyperparamètres Optuna
-        d = backbone_config["d_model"]
-        hd = best_head_params["hidden_dim"]
-        do = best_head_params["dropout_clf"]
         model.classifier = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, hd),
+            nn.LayerNorm(cfg["d_model"]),
+            nn.Linear(cfg["d_model"], hd),
             nn.GELU(),
             nn.Dropout(do),
             nn.Linear(hd, n_classes),
         ).to(device)
 
-        # ── Phase 1 : Warmup ────────────────────────────────────────────────
-        print(f"\n  ▶ Phase 1 : Warmup ({n_ep} epochs)")
+        # ── Optimiseur avec LR dédiés — gel fixe jusqu'au bout ───────────────
+        print(f"\n  ▶ Entraînement ({n_ep} epochs)")
         if strategy == "head_only":
             model.freeze_all_backbone()
             opt1 = torch.optim.AdamW(
-                model.classifier.parameters(), lr=lr_h, weight_decay=wd
+                model.classifier.parameters(),
+                lr=params_head_only["lr_head"],
+                weight_decay=params_head_only["weight_decay"],
             )
         elif strategy == "late_enc":
             model.unfreeze_late_encoders()
             opt1 = torch.optim.AdamW(
                 [
-                    {"params": model.group_enc_late.parameters(), "lr": lr_bb},
-                    {"params": model.classifier.parameters(), "lr": lr_h},
+                    {
+                        "params": model.group_enc_late.parameters(),
+                        "lr": params_late_enc["lr_late"],
+                    },
+                    {
+                        "params": model.classifier.parameters(),
+                        "lr": params_late_enc["lr_head"],
+                    },
                 ],
-                weight_decay=wd,
+                weight_decay=params_late_enc["weight_decay"],
             )
         elif strategy == "full":
             model.unfreeze_all()
             opt1 = torch.optim.AdamW(
                 [
-                    {"params": model.backbone.parameters(), "lr": lr_bb},
-                    {"params": model.classifier.parameters(), "lr": lr_h},
+                    {
+                        "params": model.backbone.parameters(),
+                        "lr": params_full_tune["lr_backbone"],
+                    },
+                    {
+                        "params": model.classifier.parameters(),
+                        "lr": params_full_tune["lr_head"],
+                    },
                 ],
-                weight_decay=wd,
+                weight_decay=params_full_tune["weight_decay"],
             )
         else:  # scratch
             model.unfreeze_all()
-            opt1 = torch.optim.AdamW(model.parameters(), lr=lr_h, weight_decay=wd)
+            opt1 = torch.optim.AdamW(
+                model.parameters(),
+                lr=best_scratch_params["lr"],
+                weight_decay=best_scratch_params["weight_decay"],
+            )
 
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=n_ep)
         train_loop(
@@ -596,33 +798,6 @@ def run_single_experiment(
             patience=12,
             scaler_amp=scaler_amp,
         )
-
-        # ── Phase 2 : Progressive unfreeze ──────────────────────────────────
-        if strategy in ("head_only", "late_enc"):
-            n_ep2 = 20
-            print(f"\n  ▶ Phase 2 : Dégel total ({n_ep2} epochs, lr_bb={lr_bb:.2e})")
-            model.unfreeze_all()
-            opt2 = torch.optim.AdamW(
-                [
-                    {"params": model.backbone.parameters(), "lr": lr_bb},
-                    {"params": model.classifier.parameters(), "lr": lr_h * 0.1},
-                ],
-                weight_decay=wd,
-            )
-            sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=n_ep2)
-            train_loop(
-                model,
-                train_dl,
-                val_dl,
-                opt2,
-                criterion,
-                n_ep2,
-                device,
-                scheduler=sch2,
-                augment=False,
-                patience=8,
-                scaler_amp=scaler_amp,
-            )
 
         acc, f1 = evaluate(model, test_dl, device)
         run_results[key] = {"label": label, "acc": acc, "f1": f1}
@@ -702,28 +877,30 @@ def print_statistics(all_results, baseline=0.40):
     return summary
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG BACKBONE
-# ══════════════════════════════════════════════════════════════════════════════
-
 # Valeurs par défaut raisonnables pour LSST (window=36, patch_len=6, stride=3 → 11 patches)
 # À remplacer par study.best_params après avoir lancé transformer_pretraining.py
 BACKBONE_CONFIG = {
+    "d_model": 256,
+    "n_heads": 8,  # 8 têtes : meilleur que 1, compatible avec d_model=256
+    "n_layers": 4,
+    "d_ff": 256,
+    "dropout": 0.08,
+    "revin": False,
+    "patch_len": 11,
+    "stride": 4,
+}
+
+BACKBONE_CONFIG2 = {
     "d_model": 128,
     "n_heads": 4,  # 4 têtes : meilleur que 1, compatible avec d_model=128
     "n_layers": 4,
-    "d_ff": 512,
-    "dropout": 0.1,
+    "d_ff": 256,
+    "dropout": 0.1948,
     "revin": False,
-    "patch_len": 6,
+    "patch_len": 10,
     "stride": 3,
 }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     import optuna
     import os
@@ -751,7 +928,7 @@ if __name__ == "__main__":
     print(f"Classes : {n_classes} | Features : {n_features}")
     print(f"Train : {X_train.shape} | Test : {X_test.shape}")
 
-    # ── Padding/truncation ───────────────────────────────────────────────────
+    # Padding/truncation pour aligner sur window=36
     def pad_truncate(X, tlen):
         out = []
         for arr in X:
@@ -768,7 +945,7 @@ if __name__ == "__main__":
     X_train = pad_truncate(X_train, LSST_WINDOW)
     X_test = pad_truncate(X_test, LSST_WINDOW)
 
-    # ── Normalisation ────────────────────────────────────────────────────────
+    # Normalisation
     B, T, C = X_train.shape
     scaler = StandardScaler().fit(X_train.reshape(-1, C))
     X_train = (
@@ -779,7 +956,7 @@ if __name__ == "__main__":
     )
     print(f"✅ Normalisé | train{X_train.shape} test{X_test.shape}")
 
-    # ── Split fixe pour Optuna ───────────────────────────────────────────────
+    # Split fixe pour Optuna
     X_tr0, X_val0, y_tr0, y_val0 = train_test_split(
         X_train, y_train_enc, test_size=0.2, stratify=y_train_enc, random_state=42
     )
@@ -797,30 +974,78 @@ if __name__ == "__main__":
         shuffle=False,
     )
 
-    # ── Optuna ───────────────────────────────────────────────────────────────
-    print("\n── Recherche Optuna (hyperparamètres de la tête, 30 trials) ──")
-    study_clf = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+    # ── Optuna — 1 étude par stratégie pré-entraînée + 1 pour scratch ────────
+    def _make_study(seed=42):
+        return optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=seed),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        )
+
+    opt_args = dict(
+        train_dl=train_dl0,
+        val_dl=val_dl0,
+        device=device,
+        window=LSST_WINDOW,
+        n_features=n_features,
+        n_classes=n_classes,
+        backbone_config=BACKBONE_CONFIG2,
+        scaler_amp=scaler_amp,
     )
-    study_clf.optimize(
-        lambda trial: objective_clf(
-            trial,
+
+    print("\n── Optuna B — Head Only (25 trials) ──")
+    study_b = _make_study()
+    study_b.optimize(lambda t: objective_head_only(t, **opt_args), n_trials=25)
+    params_head_only = study_b.best_params
+    print(f"  ✅ Best acc={study_b.best_value:.4f} | {params_head_only}")
+
+    print("\n── Optuna C — Late Encoders (25 trials) ──")
+    study_c = _make_study()
+    study_c.optimize(lambda t: objective_late_enc(t, **opt_args), n_trials=25)
+    params_late_enc = study_c.best_params
+    print(f"  ✅ Best acc={study_c.best_value:.4f} | {params_late_enc}")
+
+    print("\n── Optuna D — Full Fine-tune (25 trials) ──")
+    study_d = _make_study()
+    study_d.optimize(lambda t: objective_full_tune(t, **opt_args), n_trials=25)
+    params_full_tune = study_d.best_params
+    print(f"  ✅ Best acc={study_d.best_value:.4f} | {params_full_tune}")
+
+    print("\n── Optuna A — From Scratch backbone+tête (40 trials) ──")
+    study_scratch = _make_study()
+    study_scratch.optimize(
+        lambda t: objective_scratch(
+            t,
             train_dl0,
             val_dl0,
             device,
             LSST_WINDOW,
             n_features,
             n_classes,
-            BACKBONE_CONFIG,
             scaler_amp,
         ),
-        n_trials=30,
+        n_trials=40,
     )
-    best_head_params = study_clf.best_params
-    print(f"\n✅ Meilleurs hyperparamètres tête : {best_head_params}")
-    print(f"✅ Meilleure val acc (Optuna) : {study_clf.best_value:.4f}")
+    best_scratch_params_all = study_scratch.best_params
+    print(f"  ✅ Best acc={study_scratch.best_value:.4f} | {best_scratch_params_all}")
+
+    scratch_config = {
+        k: best_scratch_params_all[k]
+        for k in [
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "d_ff",
+            "dropout",
+            "patch_len",
+            "stride",
+        ]
+    }
+    scratch_config["revin"] = False
+    best_scratch_train_params = {
+        k: best_scratch_params_all[k]
+        for k in ["hidden_dim", "dropout_clf", "lr", "weight_decay"]
+    }
 
     # ── 15 runs statistiques ─────────────────────────────────────────────────
     print("\n── Lancement 15 runs statistiques ──")
@@ -831,8 +1056,12 @@ if __name__ == "__main__":
         y_train_enc=y_train_enc,
         X_test=X_test,
         y_test_enc=y_test_enc,
-        backbone_config=BACKBONE_CONFIG,
-        best_head_params=best_head_params,
+        backbone_config=BACKBONE_CONFIG2,
+        scratch_config=scratch_config,
+        params_head_only=params_head_only,
+        params_late_enc=params_late_enc,
+        params_full_tune=params_full_tune,
+        best_scratch_params=best_scratch_train_params,
         n_classes=n_classes,
         n_features=n_features,
         LSST_WINDOW=LSST_WINDOW,
@@ -846,12 +1075,16 @@ if __name__ == "__main__":
         {
             "summary": summary,
             "all_results": dict(all_results),
-            "backbone_config": BACKBONE_CONFIG,
-            "head_params": best_head_params,
+            "backbone_config": BACKBONE_CONFIG2,
+            "scratch_config": scratch_config,
+            "params_head_only": params_head_only,
+            "params_late_enc": params_late_enc,
+            "params_full_tune": params_full_tune,
+            "scratch_train_params": best_scratch_train_params,
             "scaler_mean": scaler.mean_,
             "scaler_std": scaler.scale_,
             "le_classes": le.classes_,
         },
-        "lsst_statistics_complete.pth",
+        "lsst_statistics_complete2.pth",
     )
-    print("\n💾 Sauvegardé : lsst_statistics_complete.pth")
+    print("\n💾 Sauvegardé : lsst_statistics_complete2.pth")
