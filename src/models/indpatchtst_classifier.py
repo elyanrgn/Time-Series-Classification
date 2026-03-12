@@ -1,3 +1,15 @@
+import importlib.util
+from pathlib import Path
+import sys
+
+# Fallback: if package not installed in this kernel, add repo root to sys.path
+if importlib.util.find_spec("src") is None:
+    # Resolve repo root from this file location (src/models/indpatchtst.py -> repo root)
+    ROOT = Path(__file__).resolve().parents[2]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+
 import torch.nn as nn
 from src.models.indpatchtst import IndPatchTST
 import torch

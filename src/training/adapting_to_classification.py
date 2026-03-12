@@ -27,6 +27,7 @@ LSST_WINDOW = 36
 
 CONFIG_DIR = "configs"
 
+# DEFAULTS OPTUNA (au cas où les YAMLs n'existent pas, pour debug ou runs rapides)
 DEFAULT_PARAMS_HEAD_ONLY = {
     "hidden_dim": 64,
     "dropout_clf": 0.4,
@@ -65,8 +66,13 @@ DEFAULT_SCRATCH_TRAIN_PARAMS = {
 }
 
 
-def _load_yaml(path, default):
+def _load_yaml(path, default=None, *, required=False):
     if not os.path.exists(path):
+        if required:
+            raise FileNotFoundError(
+                f"Missing required config: {path}. "
+                "Run indpatchtst pretraining to generate configs/backbone.yml."
+            )
         return default
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or default
@@ -74,7 +80,7 @@ def _load_yaml(path, default):
 
 def load_run_configs(config_dir=CONFIG_DIR):
     """Charge les configs Optuna depuis YAMLs (fallback sur defaults)."""
-    backbone_cfg = _load_yaml(os.path.join(config_dir, "backbone.yml"), BACKBONE_CONFIG2)
+    backbone_cfg = _load_yaml(os.path.join(config_dir, "backbone.yml"), required=True)
     scratch_cfg = _load_yaml(
         os.path.join(config_dir, "scratch_backbone.yml"), DEFAULT_SCRATCH_CONFIG
     )
@@ -378,29 +384,8 @@ def print_statistics(all_results, baseline=0.40):
 
 
 #  CONFIG BACKBONE
-# Valeurs par défaut raisonnables pour LSST (window=36, patch_len=6, stride=3 → 11 patches)
-# À remplacer par study.best_params après avoir lancé transformer_pretraining.py
-BACKBONE_CONFIG = {
-    "d_model": 256,
-    "n_heads": 8,  # 8 têtes : meilleur que 1, compatible avec d_model=256
-    "n_layers": 4,
-    "d_ff": 256,
-    "dropout": 0.08,
-    "revin": False,
-    "patch_len": 11,
-    "stride": 4,
-}
+# Le backbone est celui généré par indpatchtst (configs/backbone.yml).
 
-BACKBONE_CONFIG2 = {
-    "d_model": 128,
-    "n_heads": 4,  # 4 têtes : meilleur que 1, compatible avec d_model=128
-    "n_layers": 4,
-    "d_ff": 256,
-    "dropout": 0.1948,
-    "revin": False,
-    "patch_len": 10,
-    "stride": 3,
-}
 if __name__ == "__main__":
     train_dl0, val_dl0, test_dl0, scaler, le, n_classes, n_features = build_lsst_dataloaders(seed=0)
 
@@ -421,6 +406,8 @@ if __name__ == "__main__":
             pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
         )
 
+    backbone_cfg = _load_yaml(os.path.join(CONFIG_DIR, "backbone.yml"), required=True)
+
     opt_args = dict(
         train_dl=train_dl0,
         val_dl=val_dl0,
@@ -428,7 +415,7 @@ if __name__ == "__main__":
         window=LSST_WINDOW,
         n_features=n_features,
         n_classes=n_classes,
-        backbone_config=BACKBONE_CONFIG2,
+        backbone_config=backbone_cfg,
         scaler_amp=scaler_amp,
     )
 
@@ -486,8 +473,6 @@ if __name__ == "__main__":
     }
 
     # Sauvegarde des configs en YAML pour réutilisation dans run_statistics
-    with open(os.path.join(CONFIG_DIR, "backbone.yml"), "w", encoding="utf-8") as f:
-        yaml.safe_dump(BACKBONE_CONFIG2, f, sort_keys=False)
     with open(os.path.join(CONFIG_DIR, "scratch_backbone.yml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(scratch_config, f, sort_keys=False)
     with open(os.path.join(CONFIG_DIR, "scratch_train.yml"), "w", encoding="utf-8") as f:
@@ -508,7 +493,7 @@ if __name__ == "__main__":
         {
             "summary": summary,
             "all_results": dict(all_results),
-            "backbone_config": BACKBONE_CONFIG2,
+            "backbone_config": backbone_cfg,
             "scratch_config": scratch_config,
             "params_head_only": params_head_only,
             "params_late_enc": params_late_enc,
