@@ -101,6 +101,8 @@ This is orchestrated in `src/training/adapting_to_classification.py`.
 - `notebooks/02_train_cnn.ipynb`: CNN baseline + stats.
 - `notebooks/03_pretrain_indpatchtst.ipynb`: Optuna pretraining (ETTh1).
 - `notebooks/04_train_indpatchtst_classifier.ipynb`: transfer strategies + stats.
+- `notebooks/05_MOMENT_foundation_model.ipynb`: MOMENT-1-Large (Linear Probing vs Full Fine-Tuning).
+
 
 ## Generated Files (What Appears Where)
 - `configs/*.yml`: Optuna best configs for backbone and fine-tuning.
